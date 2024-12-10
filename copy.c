@@ -201,7 +201,27 @@ static void scantest(UnitTest t) {
 }
 /* copy.c ((prototype)) S377f */
 /* you need to redefine these functions */
-static void collect(void) { (void)scanframe; (void)scantests; assert(0); }
+static void collect(void) {
+    // loop through and scan root struct
+    // 1) global vars
+    scanenv(roots.globals.user);
+    scanenv(roots.globals.internal.pending_tests);
+    // 2) stack
+    scanframe(&roots.stack);
+    // 3) registers
+    Registerlist reg = roots.registers;
+    while(reg != NULL) {
+        scanloc(reg->hd);
+        reg = reg->tl;
+    }
+
+    // swap from and to space
+    Value *x = fromspace;
+    fromspace = tospace;
+    fromspace = x;
+
+    assert(0);
+}
 void printfinalstats(void) { assert(0); }
 /* you need to initialize this variable */
 bool gc_uses_mark_bits;
