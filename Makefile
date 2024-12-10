@@ -24,6 +24,8 @@ RM = rm -f
 .SUFFIXES:
 .SUFFIXES: .c .o
 
+all: $(RESULT)
+
 $(RESULT): $(OBJECTS)
 	$(CC) -o $@ $(LDFLAGS) $(OBJECTS)
 

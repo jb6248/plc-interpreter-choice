@@ -6,6 +6,7 @@ static int semispacesize;          // # of objects in fromspace or tospace
 /* private declarations for copying collection 276b */
 static Value *hp, *heaplimit;      // used for every allocation
 /* private declarations for copying collection 277a */
+static void copy(void);
 static void scanenv      (Env env);
 static void scanexp      (Exp exp);
 static void scanexplist  (Explist es);
@@ -199,29 +200,127 @@ static void scantest(UnitTest t) {
     }
     assert(0);
 }
-/* copy.c ((prototype)) S377f */
-/* you need to redefine these functions */
-static void collect(void) {
+
+static void set_invalid(Value *space, const int size) {
+    for (int i = 0; i < size; i++) {
+        space[i] = mkInvalid("invalid");
+    }
+}
+
+static void init_heap() {
+    // calculate how much space we need
+    int gamma = gammadesired(8, 2);
+    int space = 3 * gamma;
+    space /= 2;
+    if (space % 2 == 1) {
+        space ++;
+    }
+    // divide space into from-space and to-space
+    semispacesize = space;
+    fromspace = calloc(semispacesize, sizeof(Value));
+    tospace = calloc(semispacesize, sizeof(Value));
+    set_invalid(fromspace, semispacesize);
+    set_invalid(tospace, semispacesize);
+    hp = fromspace;
+}
+
+static void resize_heap(const long live_data) {
+    // right after collecting & copying in to-space
+    const int gamma = gammadesired(8, 2);
+    long space = gamma * live_data;
+    space /= 2;
+    if (space % 2 == 1) {
+        space ++;
+    }
+    printf("HEAP RESIZED from semispace size %d to %ld\n", semispacesize, space);
+
+    int new_size = (int)space;
+    {
+        // increase spaces and account for potentially moving
+        // pointers of realloc
+        void * new_tospace = realloc(fromspace, new_size * sizeof(Value));
+        fromspace = tospace;
+        tospace = new_tospace;
+        copy(); // moves all our pointers into the new, bigger space
+        // fromspace is now garbage
+        fromspace = realloc(fromspace, new_size * sizeof(Value));
+    }
+    // set them to be invalid
+    set_invalid(fromspace, new_size);
+    set_invalid(tospace + semispacesize, new_size - semispacesize);
+    semispacesize = new_size;
+    if (!fromspace || !tospace) {
+        printf("ERROR: couldn't allocate space for fromspace or tospace\n");
+        exit(-1);
+    }
+    if (isinspace(heaplimit, fromspace)) {
+        heaplimit = fromspace + semispacesize - 1;
+    } else if (isinspace(heaplimit, tospace)) {
+        heaplimit = tospace + semispacesize - 1;
+    } else {
+        printf("ERROR: heaplimit is not in the heap 💀💀💀\n");
+    }
+}
+
+static void copy(void) {
+    if (fromspace == NULL || tospace == NULL || semispacesize == 0) {
+        init_heap();
+    }
+
+    hp = tospace;
+    heaplimit = tospace + semispacesize - 1;
+
     // loop through and scan root struct
     // 1) global vars
-    scanenv(roots.globals.user);
-    scanenv(roots.globals.internal.pending_tests);
+    scanenv(*roots.globals.user);
+    const UnitTestlistlist ull = roots.globals.internal.pending_tests;
+    const unsigned num_test_groups = lengthULL(ull);
+    for (unsigned i = 0; i < num_test_groups; i++) {
+        scantests(nthULL(ull, i));
+    }
+
     // 2) stack
-    scanframe(&roots.stack);
+    Frame *sp = roots.stack->frames;
+    while (sp <= roots.stack->sp) {
+        scanframe(sp);
+        sp ++;
+    }
+
     // 3) registers
     Registerlist reg = roots.registers;
-    while(reg != NULL) {
+    while (reg != NULL) {
         scanloc(reg->hd);
         reg = reg->tl;
     }
+}
 
-    // swap from and to space
-    Value *x = fromspace;
-    fromspace = tospace;
+/* you need to redefine these functions */
+static void collect(void) {
+    // 1. forward roots
+    copy();
+
+    // 2. forward everything in to-space (updating the pointers)?
+
+
+    // 3. after we collect, if the heap is STILL full, we resize it
+    long live_data = hp - tospace;
+    if (isinspace(hp, tospace)) {
+        printf("hp is in tospace\n");
+    } else if (isinspace(hp, fromspace)) {
+        printf("hp is in fromspace\n");
+    }
+    printf("hp: %p, live data size: %ld\n", (void*)hp, live_data);
+    if (live_data == semispacesize) {
+        resize_heap(live_data);
+    }
+
+    // 4. swap from and to space
+    Value *x = tospace;
+    tospace = fromspace;
     fromspace = x;
 
-    assert(0);
+    heaplimit = fromspace + semispacesize - 1;
 }
 void printfinalstats(void) { assert(0); }
 /* you need to initialize this variable */
-bool gc_uses_mark_bits;
+bool gc_uses_mark_bits = false;

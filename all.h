@@ -177,8 +177,11 @@ struct XDef { XDefalt alt; union { Def def; Name use; UnitTest test; } ; };
 struct UnitTest {
     UnitTestalt alt;
     union {
+        // (check-expect (1+1) 2)
         struct { Exp check; Exp expect; } check_expect;
+        // (check-assert #t)
         Exp check_assert;
+        // (check-error (throw 'ohno))
         Exp check_error;
     } ;
 };
