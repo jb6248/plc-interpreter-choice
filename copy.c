@@ -5,6 +5,11 @@ static Value *fromspace, *tospace; // used only at GC time
 static int semispacesize;          // # of objects in fromspace or tospace
 /* private declarations for copying collection 276b */
 static Value *hp, *heaplimit;      // used for every allocation
+
+// statistics
+static int num_collections = 0;
+static int total_objects_copied = 0;
+
 /* private declarations for copying collection 277a */
 static void copy(void);
 static void scanenv      (Env env);
@@ -17,59 +22,6 @@ static void scanloc      (Value *vp);
 /* private declarations for copying collection 278b */
 static inline bool isinspace(Value *loc, Value *space) {
     return space <= loc && loc < space + semispacesize;
-}
-static void printspace(Value *loc) {
-    if (isinspace(loc, fromspace))
-        printf("fromspace(%p)", (void*)loc);
-    else if (isinspace(loc, tospace))
-        printf("tospace(%p)", (void*)loc);
-    else
-        printf("(%p not in fromspace or tospace!!)", (void*)loc);
-}
-static void print_value(Value *value) {
-    if (value == NULL) {
-        printf("NULL");
-        return;
-    }
-    switch (value->alt) {
-        case NIL:
-            printf("NIL");
-            break;
-        case BOOLV:
-            printf("BOOLV(%d)", value->boolv);
-            break;
-        case NUM:
-            printf("NUM(%d)", value->num);
-            break;
-        case SYM:
-            printf("SYM(%s)", nametostr(value->sym));
-            break;
-        case PAIR:
-            printf("PAIR(%p, %p)", (void*)value->pair.car, (void*)value->pair.cdr);
-            break;
-        case CLOSURE:
-            printf("CLOSURE");
-            break;
-        case PRIMITIVE:
-            printf("PRIMITIVE");
-            break;
-        case FORWARD:
-            printf("FORWARD(%p)", (void*)value->forward);
-            break;
-        case INVALID:
-            printf("💌");
-            break;
-        default:
-            printf("0"); // uninitialized
-    }
-}
-
-static void print_whole_space(Value *space) {
-    for (int i = 0; i < semispacesize; i++) {
-        printf("%.3d: ", i);
-        print_value(&space[i]);
-        printf("\n");
-    }
 }
 
 static Value *forward(Value *p);
@@ -85,11 +37,6 @@ struct Stack {
 /* copy.c 276c */
 int nalloc;   /* OMIT */
 Value* allocloc(void) {
-    printf("allocation:: hp=");
-    printspace(hp);
-    printf(" heaplimit=");
-    printspace(heaplimit);
-    printf("\n");
     if (hp == heaplimit || hp == NULL)
         collect();
     assert(isinspace(hp, fromspace)); /*runs after spaces are swapped*/ /*OMIT*/
@@ -145,12 +92,6 @@ static Value* forward(Value *p) {
             assert(isinspace(hp, tospace)); /* there is room */   /* OMIT */
 
     /* tell the debugging interface that [[hp]] is about to be allocated 282f */
-            printf("forwarding from p="); printspace(p);
-            printf(", hp="); printspace(hp);
-            printf(", heaplimit="); printspace(heaplimit);
-            printf(", tospace="); printspace(tospace);
-            printf(", size=%d", semispacesize);
-            printf("\n");
             gc_debug_pre_allocate(hp);
             *hp = *p;
             *p  = mkForward(hp);
@@ -272,6 +213,7 @@ static void set_invalid(Value *space, const int size) {
     }
 }
 
+/// Allocate space for the heap initially.
 static void init_heap() {
     // calculate how much space we need
     int gamma = gammadesired(8, 2);
@@ -287,9 +229,9 @@ static void init_heap() {
     set_invalid(fromspace, semispacesize);
     set_invalid(tospace, semispacesize);
     hp = fromspace;
-    printf("Initialized heap with semispace size %d\n", semispacesize); // debug
 }
 
+/// Move data from heap into a new, larger heap.
 static void resize_heap(const long live_data) {
     // right after collecting & copying in to-space
     const int gamma = gammadesired(8, 2);
@@ -298,7 +240,7 @@ static void resize_heap(const long live_data) {
         space ++;
     }
     space /= 2;
-    printf("HEAP RESIZED from semispace size %d to %ld\n", semispacesize, space);
+    printf("HEAP RESIZED from %d to %ld\n", semispacesize * 2, space * 2);
 
     int new_size = (int)space;
     {
@@ -322,6 +264,7 @@ static void resize_heap(const long live_data) {
     semispacesize = new_size;
 }
 
+/// Copy all live data in fromspace to tospace.
 static void copy(void) {
     if (fromspace == NULL || tospace == NULL || semispacesize == 0) {
         init_heap();
@@ -333,10 +276,8 @@ static void copy(void) {
 
     // loop through and scan root struct
     // 1) global vars
-    printf("copying global user vars\n");
     scanenv(*roots.globals.user);
 
-    printf("copying internal pending tests\n");
     const UnitTestlistlist ull = roots.globals.internal.pending_tests;
     const unsigned num_test_groups = lengthULL(ull);
     for (unsigned i = 0; i < num_test_groups; i++) {
@@ -344,7 +285,7 @@ static void copy(void) {
     }
 
     // 2) stack
-    printf("copying stack\n");
+    // printf("copying stack\n");
     Frame *sp = roots.stack->frames;
     while (sp < roots.stack->sp) { // sp is the first unused frame
         scanframe(sp);
@@ -352,7 +293,7 @@ static void copy(void) {
     }
 
     // 3) registers
-    printf("copying registers\n");
+    // printf("copying registers\n");
     Registerlist reg = roots.registers;
     while (reg != NULL) {
         scanloc(reg->hd);
@@ -362,43 +303,45 @@ static void copy(void) {
     // forward all the pointers in to-space
     Value *scanp = tospace;
     for (; scanp < hp; scanp++) {
-        printf("GREY %ld\n", scanp - tospace);
         scanloc(scanp);
     }
+
+    const long H = semispacesize * 2;
+    const long L = hp - tospace;
+    total_objects_copied += L;
+    printf("Heap size: %ld; Live data size: %ld; H/L ratio: %f\n", H, L, (double)H/L);
 }
 
-/* you need to redefine these functions */
+/// Do a copy-collection.
 static void collect(void) {
-    printf("Starting collection\n");
-    printf("pre-collection live data size: %ld; semispace size: %d\n", hp - fromspace, semispacesize);
     // 1. forward roots
     copy();
 
-    // 3. after we collect, if the heap is STILL full, we resize it
+    // 2. after we collect, if the heap is STILL full, we resize it
     long live_data = hp - tospace;
-    printf("post-collection live data size: %ld\n", live_data);
     if (live_data >= semispacesize - 1) {
-        printf("Resizing heap\n");
         resize_heap(live_data);
     }
 
-    // 4. swap from and to space
-    printf("Swap from and to space\n");
+    // 3. swap from and to space
     Value *x = tospace;
     tospace = fromspace;
     fromspace = x;
 
-    assert(isinspace(hp, fromspace));
+    // 4. Get ready for next "mark" phase and collect metrics
     heaplimit = fromspace + semispacesize;
-    printf("hp is %ld\n", hp - fromspace);
-    printf("fromspace:\n");
-    print_whole_space(fromspace);
-    printf("tospace: \n");
-    print_whole_space(tospace);
-    printf("Collection finished\n"); // debug
+    if (num_collections % 10 == 0) {
+        int H = semispacesize * 2;
+        printf("Heap size: %d; Cells allocated: %d\n", H, nalloc);
+    }
+    num_collections ++;
 }
+
+/// Print final statistics.
 void printfinalstats(void) {
-    assert(0);
+    int H = semispacesize * 2;
+    printf("Heap size: %d; Cells allocated: %d\n", H, nalloc);
+    printf("Total collections: %d; Total objects copied: %d\n", num_collections, total_objects_copied);
 }
 /* you need to initialize this variable */
 bool gc_uses_mark_bits = false;
