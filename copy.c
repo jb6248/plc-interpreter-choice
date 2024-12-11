@@ -18,6 +18,60 @@ static void scanloc      (Value *vp);
 static inline bool isinspace(Value *loc, Value *space) {
     return space <= loc && loc < space + semispacesize;
 }
+static void printspace(Value *loc) {
+    if (isinspace(loc, fromspace))
+        printf("fromspace(%p)", (void*)loc);
+    else if (isinspace(loc, tospace))
+        printf("tospace(%p)", (void*)loc);
+    else
+        printf("(%p not in fromspace or tospace!!)", (void*)loc);
+}
+static void print_value(Value *value) {
+    if (value == NULL) {
+        printf("NULL");
+        return;
+    }
+    switch (value->alt) {
+        case NIL:
+            printf("NIL");
+            break;
+        case BOOLV:
+            printf("BOOLV(%d)", value->boolv);
+            break;
+        case NUM:
+            printf("NUM(%d)", value->num);
+            break;
+        case SYM:
+            printf("SYM(%s)", nametostr(value->sym));
+            break;
+        case PAIR:
+            printf("PAIR(%p, %p)", (void*)value->pair.car, (void*)value->pair.cdr);
+            break;
+        case CLOSURE:
+            printf("CLOSURE");
+            break;
+        case PRIMITIVE:
+            printf("PRIMITIVE");
+            break;
+        case FORWARD:
+            printf("FORWARD(%p)", (void*)value->forward);
+            break;
+        case INVALID:
+            printf("💌");
+            break;
+        default:
+            printf("0"); // uninitialized
+    }
+}
+
+static void print_whole_space(Value *space) {
+    for (int i = 0; i < semispacesize; i++) {
+        printf("%.3d: ", i);
+        print_value(&space[i]);
+        printf("\n");
+    }
+}
+
 static Value *forward(Value *p);
 /* private declarations for copying collection S377e */
 static void collect(void);
@@ -31,10 +85,15 @@ struct Stack {
 /* copy.c 276c */
 int nalloc;   /* OMIT */
 Value* allocloc(void) {
-    if (hp == heaplimit)
+    printf("allocation:: hp=");
+    printspace(hp);
+    printf(" heaplimit=");
+    printspace(heaplimit);
+    printf("\n");
+    if (hp == heaplimit || hp == NULL)
         collect();
-    assert(hp < heaplimit);
     assert(isinspace(hp, fromspace)); /*runs after spaces are swapped*/ /*OMIT*/
+    assert(hp < heaplimit);
     nalloc++;   /* OMIT */
     /* tell the debugging interface that [[hp]] is about to be allocated 282f */
     gc_debug_pre_allocate(hp);
@@ -86,6 +145,12 @@ static Value* forward(Value *p) {
             assert(isinspace(hp, tospace)); /* there is room */   /* OMIT */
 
     /* tell the debugging interface that [[hp]] is about to be allocated 282f */
+            printf("forwarding from p="); printspace(p);
+            printf(", hp="); printspace(hp);
+            printf(", heaplimit="); printspace(heaplimit);
+            printf(", tospace="); printspace(tospace);
+            printf(", size=%d", semispacesize);
+            printf("\n");
             gc_debug_pre_allocate(hp);
             *hp = *p;
             *p  = mkForward(hp);
@@ -222,16 +287,17 @@ static void init_heap() {
     set_invalid(fromspace, semispacesize);
     set_invalid(tospace, semispacesize);
     hp = fromspace;
+    printf("Initialized heap with semispace size %d\n", semispacesize); // debug
 }
 
 static void resize_heap(const long live_data) {
     // right after collecting & copying in to-space
     const int gamma = gammadesired(8, 2);
     long space = gamma * live_data;
-    space /= 2;
     if (space % 2 == 1) {
         space ++;
     }
+    space /= 2;
     printf("HEAP RESIZED from semispace size %d to %ld\n", semispacesize, space);
 
     int new_size = (int)space;
@@ -241,25 +307,19 @@ static void resize_heap(const long live_data) {
         void * new_tospace = realloc(fromspace, new_size * sizeof(Value));
         fromspace = tospace;
         tospace = new_tospace;
+        set_invalid(tospace, new_size);
         copy(); // moves all our pointers into the new, bigger space
         // fromspace is now garbage
         fromspace = realloc(fromspace, new_size * sizeof(Value));
+        set_invalid(fromspace, new_size);
+        hp = tospace + live_data;
+        heaplimit = tospace + new_size;
     }
-    // set them to be invalid
-    set_invalid(fromspace, new_size);
-    set_invalid(tospace + semispacesize, new_size - semispacesize);
-    semispacesize = new_size;
     if (!fromspace || !tospace) {
         printf("ERROR: couldn't allocate space for fromspace or tospace\n");
         exit(-1);
     }
-    if (isinspace(heaplimit, fromspace)) {
-        heaplimit = fromspace + semispacesize - 1;
-    } else if (isinspace(heaplimit, tospace)) {
-        heaplimit = tospace + semispacesize - 1;
-    } else {
-        printf("ERROR: heaplimit is not in the heap 💀💀💀\n");
-    }
+    semispacesize = new_size;
 }
 
 static void copy(void) {
@@ -268,11 +328,15 @@ static void copy(void) {
     }
 
     hp = tospace;
-    heaplimit = tospace + semispacesize - 1;
+    heaplimit = tospace + semispacesize;
+    set_invalid(tospace, semispacesize);
 
     // loop through and scan root struct
     // 1) global vars
+    printf("copying global user vars\n");
     scanenv(*roots.globals.user);
+
+    printf("copying internal pending tests\n");
     const UnitTestlistlist ull = roots.globals.internal.pending_tests;
     const unsigned num_test_groups = lengthULL(ull);
     for (unsigned i = 0; i < num_test_groups; i++) {
@@ -280,47 +344,61 @@ static void copy(void) {
     }
 
     // 2) stack
+    printf("copying stack\n");
     Frame *sp = roots.stack->frames;
-    while (sp <= roots.stack->sp) {
+    while (sp < roots.stack->sp) { // sp is the first unused frame
         scanframe(sp);
         sp ++;
     }
 
     // 3) registers
+    printf("copying registers\n");
     Registerlist reg = roots.registers;
     while (reg != NULL) {
         scanloc(reg->hd);
         reg = reg->tl;
     }
+
+    // forward all the pointers in to-space
+    Value *scanp = tospace;
+    for (; scanp < hp; scanp++) {
+        printf("GREY %ld\n", scanp - tospace);
+        scanloc(scanp);
+    }
 }
 
 /* you need to redefine these functions */
 static void collect(void) {
+    printf("Starting collection\n");
+    printf("pre-collection live data size: %ld; semispace size: %d\n", hp - fromspace, semispacesize);
     // 1. forward roots
     copy();
 
-    // 2. forward everything in to-space (updating the pointers)?
-
-
     // 3. after we collect, if the heap is STILL full, we resize it
     long live_data = hp - tospace;
-    if (isinspace(hp, tospace)) {
-        printf("hp is in tospace\n");
-    } else if (isinspace(hp, fromspace)) {
-        printf("hp is in fromspace\n");
-    }
-    printf("hp: %p, live data size: %ld\n", (void*)hp, live_data);
-    if (live_data == semispacesize) {
+    printf("post-collection live data size: %ld\n", live_data);
+    if (live_data >= semispacesize - 1) {
+        printf("Resizing heap\n");
         resize_heap(live_data);
     }
 
     // 4. swap from and to space
+    printf("Swap from and to space\n");
     Value *x = tospace;
     tospace = fromspace;
     fromspace = x;
 
-    heaplimit = fromspace + semispacesize - 1;
+    assert(isinspace(hp, fromspace));
+    heaplimit = fromspace + semispacesize;
+    printf("hp is %ld\n", hp - fromspace);
+    printf("fromspace:\n");
+    print_whole_space(fromspace);
+    printf("tospace: \n");
+    print_whole_space(tospace);
+    printf("Collection finished\n"); // debug
 }
-void printfinalstats(void) { assert(0); }
+void printfinalstats(void) {
+    assert(0);
+}
 /* you need to initialize this variable */
 bool gc_uses_mark_bits = false;
